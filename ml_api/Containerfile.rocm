@@ -64,8 +64,8 @@ COPY . /app
 
 EXPOSE 3333
 
-# Switches off one MIOpen solver that crashes gfx1103 (Radeon 780M/760M) and
-# leaves every other target alone; see scripts/rocm_entrypoint.sh.
+# Switches off one MIOpen solver that crashes gfx1103 (Radeon 780M/760M) on
+# gfx11.0.x parts only; see scripts/rocm_entrypoint.sh.
 ENTRYPOINT ["sh", "/app/scripts/rocm_entrypoint.sh"]
 
 # --timeout: server.py loads the model at import, inside worker boot, and the

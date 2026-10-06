@@ -1,0 +1,74 @@
+# AMD GPU (ROCm) build of the Obico ML failure-detection API.
+#
+# ONNX Runtime has no supported execution provider for consumer AMD GPUs, so
+# this image runs the ONNX model through PyTorch instead: lib/torch_onnx.py
+# converts it with onnx2torch, and load_net() tries that before ONNX Runtime.
+# AMD publishes ROCm builds of PyTorch from TheRock with each GPU target's
+# kernels in a separate package, so the image carries only the targets named
+# in ROCM_DEVICES. ONNX Runtime (CPU) stays in as the fallback when the container
+# sees no GPU.
+#
+# Run it with the GPU passed through: --device /dev/kfd --device /dev/dri.
+#
+# Python 3.12: AMD's torch wheels are built for 3.11 and 3.12 only.
+FROM python:3.12-slim
+
+# libgomp1: OpenMP runtime required by ONNX Runtime.
+# libglib2.0-0: shared object required by opencv-python-headless.
+RUN apt-get update \
+    && apt-get install --no-install-recommends --assume-yes \
+        curl ca-certificates libgomp1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# One or more TheRock device extras, comma separated: device-gfx1103 (Radeon
+# 780M/760M), device-gfx1150 (Radeon 890M), device-gfx1100 (RX 7900),
+# device-gfx1151 (Strix Halo), ... The full table is in TheRock's RELEASES.md.
+ARG ROCM_DEVICES=device-gfx1103
+ARG ROCM_INDEX_URL=https://stable.repo.amd.com/rocm/whl-next/
+ARG TORCH_VERSION=2.14.0+rocm10.1.0
+ARG TORCHVISION_VERSION=0.29.0a0+rocm10.1.0
+
+# AMD's index alone, not merged with PyPI: PyPI publishes a CUDA torch with a
+# higher version number, which pip would prefer, and also carries packages
+# named rocm and rocm-sdk-* that pip could mix in. The AMD index mirrors
+# torch's other dependencies.
+# torchvision is there because onnx2torch imports it.
+#
+# The second install then pins torch and torchvision to what the first one
+# installed, so nothing from PyPI can replace them.
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir --index-url "${ROCM_INDEX_URL}" \
+        "torch[${ROCM_DEVICES}]==${TORCH_VERSION}" \
+        "torchvision[${ROCM_DEVICES}]==${TORCHVISION_VERSION}" \
+    && pip freeze | grep -E '^(torch|torchvision)==' > /tmp/rocm-pins.txt \
+    && pip install --no-cache-dir --constraint /tmp/rocm-pins.txt \
+        onnx==1.23.2 \
+        onnx2torch==1.5.15 \
+        onnxruntime==1.30.0 \
+        opencv-python-headless==4.12.0.88 \
+    && rm /tmp/rocm-pins.txt
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --requirement requirements.txt
+
+COPY model/*.url model/*.sha256 /app/model/
+COPY scripts/fetch_verified.sh /usr/local/bin/fetch_verified
+RUN mkdir -p /model_cache/ml_api/onnx \
+    && fetch_verified "$(tr -d '\r' < model/model-weights.onnx.url)" \
+        /model_cache/ml_api/onnx/model-weights.onnx 50000000 \
+        "$(tr -d '\r' < model/model-weights.onnx.sha256)"
+
+COPY . /app
+
+EXPOSE 3333
+
+# Switches off one MIOpen solver that crashes gfx1103 (Radeon 780M/760M) and
+# leaves every other target alone; see scripts/rocm_entrypoint.sh.
+ENTRYPOINT ["sh", "/app/scripts/rocm_entrypoint.sh"]
+
+# --timeout: server.py loads the model at import, inside worker boot, and the
+# first pass on the GPU compiles its kernels. gunicorn kills a worker that has
+# not booted within the timeout.
+CMD ["gunicorn", "--bind", "0.0.0.0:3333", "--workers", "1", "--timeout", "120", "wsgi"]

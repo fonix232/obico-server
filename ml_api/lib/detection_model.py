@@ -28,6 +28,13 @@ except Exception as e:
     print(f'Error during importing RknnNet! - {e}')
     rknn_ready = False
 
+torch_ready = True
+try:
+    from lib.torch_onnx import TorchOnnxNet
+except Exception as e:
+    print(f'Error during importing TorchOnnxNet! - {e}')
+    torch_ready = False
+
 
 def load_net(config_path, meta_path, weights_path=None):
 
@@ -35,11 +42,17 @@ def load_net(config_path, meta_path, weights_path=None):
         for net_config in net_config_priority:
             weights = net_config['weights_path']
             use_gpu = net_config['use_gpu']
+            runtime = net_config.get('runtime')
 
             net_main = None
             try:
-                print(f'----- Trying to load weights: {weights} - use_gpu = {use_gpu} -----')
-                if weights.endswith(".onnx"):
+                print(f'----- Trying to load weights: {weights} - use_gpu = {use_gpu}' + (f' - runtime = {runtime}' if runtime else '') + ' -----')
+                if runtime == 'torch':
+                    if not torch_ready:
+                        raise Exception('Not loading the ONNX net in PyTorch due to previous import failure. Check earlier log for errors.')
+                    net_main = TorchOnnxNet(weights, meta_path, use_gpu)
+
+                elif weights.endswith(".onnx"):
                     if not onnx_ready:
                         raise Exception('Not loading ONNX net due to previous import failure. Check earlier log for errors.')
                     net_main = OnnxNet(weights, meta_path, use_gpu)
@@ -70,6 +83,8 @@ def load_net(config_path, meta_path, weights_path=None):
     net_config_priority = [
             dict(weights_path='/model_cache/ml_api/darknet/model-weights.darknet', use_gpu=True),
             dict(weights_path='/model_cache/ml_api/darknet/model-weights.darknet', use_gpu=False),
+            # The ONNX model on an AMD (ROCm) GPU, which ONNX Runtime cannot use.
+            dict(weights_path='/model_cache/ml_api/onnx/model-weights.onnx', use_gpu=True, runtime='torch'),
             dict(weights_path='/model_cache/ml_api/onnx/model-weights.onnx', use_gpu=True),
             dict(weights_path='/model_cache/ml_api/onnx/model-weights.onnx', use_gpu=False),
             dict(weights_path='/model_cache/ml_api/rknn/model-weights.rknn', use_gpu=False),

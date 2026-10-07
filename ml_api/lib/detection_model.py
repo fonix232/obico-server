@@ -28,6 +28,13 @@ except Exception as e:
     print(f'Error during importing RknnNet! - {e}')
     rknn_ready = False
 
+xdna_ready = True
+try:
+    from lib.xdna_net import XdnaNet
+except Exception as e:
+    print(f'Error during importing XdnaNet! - {e}')
+    xdna_ready = False
+
 torch_ready = True
 try:
     from lib.torch_onnx import TorchOnnxNet
@@ -47,7 +54,12 @@ def load_net(config_path, meta_path, weights_path=None):
             net_main = None
             try:
                 print(f'----- Trying to load weights: {weights} - use_gpu = {use_gpu}' + (f' - runtime = {runtime}' if runtime else '') + ' -----')
-                if runtime == 'torch':
+                if runtime == 'xdna':
+                    if not xdna_ready:
+                        raise Exception('Not loading the ONNX net on the NPU due to previous import failure. Check earlier log for errors.')
+                    net_main = XdnaNet(weights, meta_path, use_gpu)
+
+                elif runtime == 'torch':
                     if not torch_ready:
                         raise Exception('Not loading the ONNX net in PyTorch due to previous import failure. Check earlier log for errors.')
                     net_main = TorchOnnxNet(weights, meta_path, use_gpu)
@@ -81,6 +93,8 @@ def load_net(config_path, meta_path, weights_path=None):
 
     model_dir = path.join(path.dirname(path.realpath(__file__)), '..', 'model')
     net_config_priority = [
+            # The ONNX model on an AMD XDNA1 NPU, through precompiled mlir-aie programs.
+            dict(weights_path='/model_cache/ml_api/onnx/model-weights.onnx', use_gpu=True, runtime='xdna'),
             dict(weights_path='/model_cache/ml_api/darknet/model-weights.darknet', use_gpu=True),
             dict(weights_path='/model_cache/ml_api/darknet/model-weights.darknet', use_gpu=False),
             # The ONNX model on an AMD (ROCm) GPU, which ONNX Runtime cannot use.

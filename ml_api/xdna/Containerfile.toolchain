@@ -1,0 +1,56 @@
+# XDNA1 (Ryzen AI NPU, Phoenix/Hawk Point npu1) development toolchain.
+#
+# Userspace only: the amdxdna kernel driver and NPU firmware come from the
+# host (tested with Linux 6.18's in-tree driver). XRT and the XDNA SHIM are built from
+# amd/xdna-driver with -nokmod; IRON (mlir-aie) and Peano are the versions
+# phhusson/amd-npu-gguf was tested with on a Ryzen 7 8845HS.
+#
+# Run with: --device /dev/accel/accel0 --ulimit memlock=-1
+
+FROM ubuntu:24.04 AS xrt-build
+ARG XDNA_REF=49fe4e1386
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates sudo lsb-release \
+        build-essential cmake pkg-config python3 file \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone https://github.com/amd/xdna-driver.git /src/xdna \
+    && cd /src/xdna && git checkout "${XDNA_REF}" \
+    && git submodule update --init --recursive --depth 1
+# xrtdeps.sh asks for linux-headers-$(uname -r); in a container that is the
+# build host's kernel, which Ubuntu may have no package for, and apt then refuses
+# the whole list. No module is built here (-nokmod), so that entry becomes a
+# no-op (deleting the line would leave an empty if-block).
+RUN sed -i 's/^\([[:space:]]*\)UB_LIST+=(linux-headers-.*/\1:/' /src/xdna/xrt/src/runtime_src/tools/scripts/xrtdeps.sh \
+    && apt-get update && /src/xdna/tools/amdxdna_deps.sh && rm -rf /var/lib/apt/lists/*
+RUN cd /src/xdna/xrt/build && ./build.sh -npu -opt -j "$(nproc)"
+RUN apt-get update \
+    && apt-get install -y /src/xdna/xrt/build/Release/xrt_*-base.deb /src/xdna/xrt/build/Release/xrt_*-npu.deb \
+    && rm -rf /var/lib/apt/lists/*
+RUN cd /src/xdna/build && ./build.sh -release -nokmod
+RUN mkdir /out \
+    && cp /src/xdna/xrt/build/Release/xrt_*-base.deb /src/xdna/xrt/build/Release/xrt_*-npu.deb /out/ \
+    && cp /src/xdna/build/Release/*.deb /out/ \
+    && ls -la /out
+
+FROM ubuntu:24.04
+ARG MLIR_AIE_REF=v1.4.3
+ENV DEBIAN_FRONTEND=noninteractive
+COPY --from=xrt-build /out/ /tmp/debs/
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates make cmake ninja-build \
+        python3.12 python3.12-venv python3.12-dev python3-pip build-essential clang lld jq \
+    && apt-get install -y /tmp/debs/xrt_*-base.deb /tmp/debs/xrt_*-npu.deb \
+    && (dpkg -i /tmp/debs/xrt_plugin*.deb || (apt-get install -y -f && dpkg -i /tmp/debs/xrt_plugin*.deb)) \
+    && rm -rf /var/lib/apt/lists/* /tmp/debs
+RUN git clone https://github.com/Xilinx/mlir-aie.git /opt/mlir-aie \
+    && cd /opt/mlir-aie && git checkout "${MLIR_AIE_REF}"
+# AMD's installer creates /opt/mlir-aie/ironenv with the mlir_aie wheel of the
+# checked-out release tag and the Peano pin of that tag. Its last step looks
+# for an NPU through xrt-smi, which a build has no device for, so its status
+# is ignored and the installed packages are checked instead.
+RUN cd /opt/mlir-aie && bash -c '. /opt/xilinx/xrt/setup.sh; source utils/env_install.sh; true' \
+    && /opt/mlir-aie/ironenv/bin/pip show mlir_aie llvm-aie | grep -E "^(Name|Version):"
+COPY env.sh /etc/profile.d/xdna.sh
+WORKDIR /work
+CMD ["bash", "-l"]

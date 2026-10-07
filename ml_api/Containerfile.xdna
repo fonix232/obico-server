@@ -1,0 +1,115 @@
+# AMD XDNA1 NPU (Ryzen 7040/8040 "Phoenix"/"Hawk Point", npu1) build of the
+# Obico ML failure-detection API.
+#
+# The convolutions run on the NPU through mlir-aie programs (xdna/conv_rt.py)
+# that are compiled here, at image build, with no device needed; the runtime
+# image carries only XRT, its Python bindings and the compiled programs. See
+# xdna/yolo_npu.py for the network and lib/xdna_net.py for the CPU fallback.
+#
+# The kernel driver (amdxdna) and NPU firmware come from the host: this image
+# builds XRT and the XDNA userspace plugin from amd/xdna-driver without the
+# module (-nokmod). Tested with Linux 6.18's in-tree amdxdna, firmware 1.5.2.
+#
+# Run it with: --device /dev/accel/accel0 --ulimit memlock=-1
+#
+# Stage 1: XRT + XDNA plugin packages.
+FROM ubuntu:24.04 AS xrt-build
+ARG XDNA_REF=49fe4e1386
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates sudo lsb-release \
+        build-essential cmake pkg-config python3 file \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone https://github.com/amd/xdna-driver.git /src/xdna \
+    && cd /src/xdna && git checkout "${XDNA_REF}" \
+    && git submodule update --init --recursive --depth 1
+# xrtdeps.sh asks for linux-headers-$(uname -r); in a container that is the
+# build host's kernel, which Ubuntu may have no package for, and apt then
+# refuses the whole list. No module is built here (-nokmod), so that entry
+# becomes a no-op (deleting the line would leave an empty if-block).
+RUN sed -i 's/^\([[:space:]]*\)UB_LIST+=(linux-headers-.*/\1:/' /src/xdna/xrt/src/runtime_src/tools/scripts/xrtdeps.sh \
+    && apt-get update && /src/xdna/tools/amdxdna_deps.sh && rm -rf /var/lib/apt/lists/*
+RUN cd /src/xdna/xrt/build && ./build.sh -npu -opt -j "$(nproc)"
+RUN apt-get update \
+    && apt-get install -y /src/xdna/xrt/build/Release/xrt_*-base.deb /src/xdna/xrt/build/Release/xrt_*-npu.deb \
+    && rm -rf /var/lib/apt/lists/*
+RUN cd /src/xdna/build && ./build.sh -release -nokmod
+RUN mkdir /out \
+    && cp /src/xdna/xrt/build/Release/xrt_*-base.deb /src/xdna/xrt/build/Release/xrt_*-npu.deb /out/ \
+    && cp /src/xdna/build/Release/*.deb /out/ \
+    && ls -la /out
+
+# Stage 2: mlir-aie (IRON) + Peano, and the NPU programs for this model.
+FROM ubuntu:24.04 AS compile
+ARG MLIR_AIE_REF=v1.4.3
+ENV DEBIAN_FRONTEND=noninteractive
+COPY --from=xrt-build /out/ /tmp/debs/
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates make cmake ninja-build \
+        python3.12 python3.12-venv python3.12-dev python3-pip build-essential clang lld jq \
+    && apt-get install -y /tmp/debs/xrt_*-base.deb /tmp/debs/xrt_*-npu.deb \
+    && (dpkg -i /tmp/debs/xrt_plugin*.deb || (apt-get install -y -f && dpkg -i /tmp/debs/xrt_plugin*.deb)) \
+    && rm -rf /var/lib/apt/lists/* /tmp/debs
+RUN git clone https://github.com/Xilinx/mlir-aie.git /opt/mlir-aie \
+    && cd /opt/mlir-aie && git checkout "${MLIR_AIE_REF}"
+# AMD's installer: the mlir_aie wheel of the checked-out release tag and that
+# tag's Peano pin. Its last step looks for an NPU through xrt-smi, which a
+# build has none of, so its status is ignored and the packages are checked.
+RUN cd /opt/mlir-aie && bash -c '. /opt/xilinx/xrt/setup.sh; source utils/env_install.sh; true' \
+    && /opt/mlir-aie/ironenv/bin/pip show mlir_aie llvm-aie | grep -E "^(Name|Version):"
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/* \
+    && /opt/mlir-aie/ironenv/bin/pip install --no-cache-dir onnx==1.23.2 onnxruntime==1.30.0
+COPY model/*.url model/*.sha256 /app/model/
+COPY scripts/fetch_verified.sh /usr/local/bin/fetch_verified
+RUN mkdir -p /model_cache/ml_api/onnx \
+    && fetch_verified "$(tr -d '\r' < /app/model/model-weights.onnx.url)" \
+        /model_cache/ml_api/onnx/model-weights.onnx 50000000 \
+        "$(tr -d '\r' < /app/model/model-weights.onnx.sha256)"
+COPY xdna /app/xdna
+RUN bash -c '. /opt/xilinx/xrt/setup.sh >/dev/null; . /opt/mlir-aie/ironenv/bin/activate; \
+        . /opt/mlir-aie/utils/env_setup.sh >/dev/null 2>&1; cd /app/xdna \
+        && MODEL=/model_cache/ml_api/onnx/model-weights.onnx RT_CACHE=/opt/xdna/rt NPU_CACHE_HOME=/tmp/npu-cache \
+           MLIR_AIE_SOURCE=/opt/mlir-aie python yolo_npu.py --compile' \
+    && find /opt/xdna/rt -mindepth 1 ! -name '*.xclbin' ! -name '*.bin' -prune -exec rm -rf {} + \
+    && ls /opt/xdna/rt | wc -l
+
+# Stage 3: the runtime.
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+COPY --from=xrt-build /out/ /tmp/debs/
+# libgomp1: OpenMP runtime required by ONNX Runtime.
+# libglib2.0-0: shared object required by opencv-python-headless.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl python3.12 python3.12-venv libgomp1 libglib2.0-0 \
+    && apt-get install -y /tmp/debs/xrt_*-base.deb /tmp/debs/xrt_*-npu.deb \
+    && (dpkg -i /tmp/debs/xrt_plugin*.deb || (apt-get install -y -f && dpkg -i /tmp/debs/xrt_plugin*.deb)) \
+    && rm -rf /var/lib/apt/lists/* /tmp/debs
+RUN python3.12 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+RUN pip install --no-cache-dir \
+        ml_dtypes==0.6.0 \
+        onnx==1.23.2 \
+        onnxruntime==1.30.0 \
+        opencv-python-headless==4.12.0.88
+
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --requirement requirements.txt
+
+COPY --from=compile /model_cache /model_cache
+COPY --from=compile /opt/xdna/rt /opt/xdna/rt
+COPY . /app
+
+# pyxrt and libxrt from the XRT packages; the programs compiled in stage 2.
+ENV XILINX_XRT=/opt/xilinx/xrt \
+    LD_LIBRARY_PATH=/opt/xilinx/xrt/lib \
+    PYTHONPATH=/opt/xilinx/xrt/python \
+    XDNA_RT_CACHE=/opt/xdna/rt \
+    OPENBLAS_NUM_THREADS=1 \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 3333
+
+# --timeout: server.py loads the model at import, inside worker boot, and the
+# NPU setup creates hardware contexts and buffers for every layer.
+CMD ["gunicorn", "--bind", "0.0.0.0:3333", "--workers", "1", "--timeout", "120", "wsgi"]
